@@ -1,6 +1,7 @@
 ---
 title: "LLM 算子梳理：从 Decoder 到 FlashInfer"
 date: 2026-10-20T13:00:00+08:00
+lastmod: 2026-10-20T16:00:00+08:00
 draft: false
 description: "用 Decoder 的张量形状梳理线性层、RoPE、Attention、RMSNorm 和 SwiGLU，并对应到 FlashInfer 源码"
 slug: "llm-operators-flashinfer"
@@ -12,11 +13,21 @@ math: true
 
 # LLM 算子梳理：从 Decoder 到 FlashInfer
 
-LLM 算子优化首先需要回答：输入输出是什么形状，计算与访存分别有多少，当前瓶颈在哪里。相同的线性层在长 prompt 的 prefill 和单 token 的 decode 中，可能需要完全不同的实现策略。
+- [LLM 算子梳理：从 Decoder 到 FlashInfer](#llm-算子梳理从-decoder-到-flashinfer)
+  - [1. 维度约定](#1-维度约定)
+  - [2. 一层 Decoder 的计算路径](#2-一层-decoder-的计算路径)
+  - [3. 线性映射：先写成矩阵乘](#3-线性映射先写成矩阵乘)
+  - [4. RMSNorm：归约与逐元素操作](#4-rmsnorm归约与逐元素操作)
+  - [5. RoPE：位置、布局与 KV 写入](#5-rope位置布局与-kv-写入)
+  - [6. Attention：分开看 Prefill 与 Decode](#6-attention分开看-prefill-与-decode)
+  - [7. SwiGLU 与算子融合](#7-swiglu-与算子融合)
+  - [8. 量化与 MoE 的额外成本](#8-量化与-moe-的额外成本)
+  - [9. 从 Python API 追到 Kernel](#9-从-python-api-追到-kernel)
+  - [10. 实验配置](#10-实验配置)
 
-本文以常见的 pre-norm、RoPE、GQA、SwiGLU Decoder 为例。不同模型可能使用 LayerNorm、QK Norm、MoE 或其他结构，不能把这一条计算路径套到所有模型。
+以采用 RoPE、GQA、SwiGLU 的 pre-norm Decoder 为例，按张量形状、计算量和访存量梳理各层算子。模型的归一化、位置编码和 FFN 结构不同，算子路径也随之变化。
 
-## 1. 先统一维度
+## 1. 维度约定
 
 | 符号 | 含义 |
 |------|------|
@@ -140,7 +151,7 @@ MoE 在线性层外还有路由、token 重排、按专家分组与输出归并�
 
 例如 `SegmentGEMMWrapper.run` 会先准备每个 segment 的指针、维度和 stride，再选择 SM80/SM90 路径；不应把 Python wrapper 本身当作 GEMM 主循环。
 
-## 10. 如何安排优化实验
+## 10. 实验配置
 
 先记录 GPU、驱动、CUDA、库版本、输入 shape、dtype、stride 和 backend。分别测长短 prompt、不同 batch 的 decode，以及真实 KV 长度分布。
 

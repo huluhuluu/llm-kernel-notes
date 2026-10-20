@@ -1,6 +1,7 @@
 ---
 title: "GEMM 优化：FlashInfer 与 CUTLASS"
 date: 2026-10-20T13:10:00+08:00
+lastmod: 2026-10-20T16:00:00+08:00
 draft: false
 description: "从 LLM 线性层的形状出发，结合 FlashInfer SegmentGEMM 和 CUTLASS 理解分块、流水线、小 M 与分组调度"
 slug: "llm-gemm-flashinfer-cutlass"
@@ -12,11 +13,23 @@ math: true
 
 # GEMM 优化：FlashInfer 与 CUTLASS
 
-GEMM 优化的核心是把矩阵乘法映射到 GPU 的存储层次和并行结构。本文先解释分块如何减少搬运，再沿 FlashInfer 的 `SegmentGEMMWrapper` 追到 CUTLASS 配置，最后讨论 decode 的小 M 和 grouped GEMM。
+- [GEMM 优化：FlashInfer 与 CUTLASS](#gemm-优化flashinfer-与-cutlass)
+  - [1. Linear 的矩阵形状](#1-linear-的矩阵形状)
+  - [2. 分块与数据复用](#2-分块与数据复用)
+  - [3. CUTLASS 的分层映射](#3-cutlass-的分层映射)
+  - [4. 流水线](#4-流水线)
+  - [5. FlashInfer SegmentGEMM 的语义](#5-flashinfer-segmentgemm-的语义)
+  - [6. SM80 路径与配置](#6-sm80-路径与配置)
+  - [7. 小 M、Split-K 与 grouped GEMM](#7-小-msplit-k-与-grouped-gemm)
+  - [8. Epilogue 与低精度](#8-epilogue-与低精度)
+  - [9. 调用与验证](#9-调用与验证)
+  - [10. 实验变量](#10-实验变量)
 
-源码固定为 FlashInfer `v0.2.5`，commit `592b110a78725e034daf3a3c978053e7dae92e5c`。补充阅读采用 CUTLASS `v3.8.0`，不是对 FlashInfer 内置依赖版本的声明。
+从 Linear 的 M/N/K 出发，梳理分块复用、流水线与分组调度，并对照 FlashInfer SegmentGEMM 的 CUTLASS 实现。
 
-## 1. 把 Linear 写成明确的 M、N、K
+源码基线：FlashInfer `v0.2.5`；CUTLASS `v3.8.0` 为补充阅读版本。
+
+## 1. Linear 的矩阵形状
 
 PyTorch 风格权重 `W[N,K]` 对应 `Y=XWᵀ`：
 
@@ -30,7 +43,7 @@ Y: [M,N]
 
 LLM 中 M 是本次 token 数，K 是输入通道，N 是输出通道。Prefill 往往有较大的 M；普通小 batch decode 中 M 很小。仅给出“4096×4096 权重”不足以描述一次 GEMM。
 
-## 2. 从逐元素计算到分块复用
+## 2. 分块与数据复用
 
 一个线程计算一个输出时，需要遍历 K。相邻输出会反复使用 A 的同一行或 B 的同一列，因此先让一个线程块协同计算 `BM×BN` 的输出块。
 
@@ -63,7 +76,7 @@ $$
 
 全局内存需要尽量合并访问；共享内存布局还要适配 MMA 的取数方式，减少 bank conflict。数学上正确的转置，不代表物理加载就是高效的。
 
-## 4. 流水线重叠搬运与计算
+## 4. 流水线
 
 朴素实现先加载、同步、计算、再加载下一块，计算单元可能等待数据。多 stage 流水线在计算当前块时，提前准备后续块。
 
@@ -99,7 +112,7 @@ Y[48:96] = X[48:96] @ weights[2].T
 
 分组前提是输入已经按所需 segment 排好。MoE 的 top-k 路由、token 复制、排列和按权重归并不在这个接口内。
 
-## 6. 沿 SM80 路径读到具体配置
+## 6. SM80 路径与配置
 
 固定版本的调用链为：
 
@@ -154,7 +167,7 @@ FP16/BF16 输入加 FP32 累加仍可能在最终转换时损失精度。FP8/INT
 
 性能对比应报告量化、打包和重排是否计入。一次性权重预处理可以单独列出；随 token 重复执行的预处理需要计入逐 token 延迟。
 
-## 9. 一个可检查的调用
+## 9. 调用与验证
 
 在已配置 FlashInfer v0.2.5 的 CUDA 环境中：
 
@@ -180,7 +193,7 @@ torch.testing.assert_close(y.float(), reference, rtol=1e-2, atol=2e-2)
 
 完整脚本见[配套示例](https://github.com/huluhuluu/llm-kernel-notes/blob/main/examples/verify_kernels.py)。它测量预热后的 API 调用，包含 wrapper 内的参数构造和输出分配，不冒充纯 GEMM kernel 时间。
 
-## 10. 实验要改变哪些变量
+## 10. 实验变量
 
 | 维度 | 建议记录或扫描 |
 |------|----------------|

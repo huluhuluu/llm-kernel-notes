@@ -1,6 +1,7 @@
 ---
 title: "Attention 优化：FlashInfer 的 Prefill 与 Decode"
 date: 2026-10-20T13:20:00+08:00
+lastmod: 2026-10-20T16:00:00+08:00
 draft: false
 description: "从 Online Softmax 推导出发，结合 FlashInfer 源码解释 Prefill、Decode、Split-KV、Paged KV 与正确性验证"
 slug: "llm-attention-flashinfer"
@@ -12,9 +13,21 @@ math: true
 
 # Attention 优化：FlashInfer 的 Prefill 与 Decode
 
-Attention 的优化同时涉及数学等价变换、访存与服务调度。FlashAttention 减少中间注意力矩阵的读写，Paged KV 管理变长请求的缓存，Split-KV 增加长序列 decode 的并行度。这些方法解决不同问题，可以在同一实现中组合。
+- [Attention 优化：FlashInfer 的 Prefill 与 Decode](#attention-优化flashinfer-的-prefill-与-decode)
+  - [1. Shape、head 映射与 mask](#1-shapehead-映射与-mask)
+  - [2. 朴素 Attention 的额外流量](#2-朴素-attention-的额外流量)
+  - [3. Online Softmax 的状态](#3-online-softmax-的状态)
+  - [4. Prefill：在分块矩阵乘中维护状态](#4-prefill在分块矩阵乘中维护状态)
+  - [5. Decode：KV 流量与并行度](#5-decodekv-流量与并行度)
+  - [6. Split-KV 的状态如何合并](#6-split-kv-的状态如何合并)
+  - [7. Paged KV：逻辑连续，物理分散](#7-paged-kv逻辑连续物理分散)
+  - [8. plan 与 run 的边界](#8-plan-与-run-的边界)
+  - [9. 最小正确性验证](#9-最小正确性验证)
+  - [10. 性能比较需要保持哪些条件一致](#10-性能比较需要保持哪些条件一致)
 
-本文源码固定为 FlashInfer `v0.2.5`，commit `592b110a78725e034daf3a3c978053e7dae92e5c`；示例仅讨论无 dropout 的推理 Attention。
+FlashAttention 减少注意力中间矩阵的读写，Paged KV 管理缓存页，Split-KV 沿 KV 长度拆分计算。下文结合 FlashInfer 区分 prefill 与 decode 的实现。
+
+源码基线：FlashInfer `v0.2.5`；示例为无 dropout 的推理 Attention。
 
 ## 1. Shape、head 映射与 mask
 
